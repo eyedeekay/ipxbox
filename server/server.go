@@ -51,15 +51,16 @@ type Protocol interface {
 
 // client represents a client that is connected to an IPX server.
 type client struct {
-	s               *Server
-	closed          bool
-	rxpipe          ipx.ReadWriteCloser
-	addr            *net.UDPAddr
+	*Server
+	net.Addr
+	closed bool
+	ipx.ReadWriteCloser
+
 	lastReceiveTime time.Time
 }
 
 func (c *client) ReadPacket(ctx context.Context) (*ipx.Packet, error) {
-	return c.rxpipe.ReadPacket(ctx)
+	return c.ReadWriteCloser.ReadPacket(ctx)
 }
 
 func (c *client) WritePacket(packet *ipx.Packet) error {
@@ -67,32 +68,34 @@ func (c *client) WritePacket(packet *ipx.Packet) error {
 	if err != nil {
 		return err
 	}
-	_, err = c.s.socket.WriteToUDP(packetBytes, c.addr)
+	_, err = c.Server.PacketConn.WriteTo(packetBytes, c.Addr)
 	return err
 }
 
 func (c *client) Close() error {
-	c.s.mu.Lock()
-	defer c.s.mu.Unlock()
+	c.Server.mu.Lock()
+	defer c.Server.mu.Unlock()
 	if !c.closed {
-		delete(c.s.clients, c.addr.String())
+		delete(c.Server.clients, c.Addr.String())
 		c.closed = true
 	}
-	return c.rxpipe.Close()
+	return c.ReadWriteCloser.Close()
 }
 
 // Server is the top-level struct representing an IPX server that listens
 // on a UDP port.
 type Server struct {
-	mu               sync.Mutex
-	config           *Config
-	socket           *net.UDPConn
+	mu     sync.Mutex
+	config *Config
+	net.PacketConn
 	clients          map[string]*client
 	timeoutCheckTime time.Time
 }
 
+var New = NewServer
+
 // New creates a new Server, listening on the given address.
-func New(addr string, c *Config) (*Server, error) {
+func NewServer(addr string, c *Config) (*Server, error) {
 	udp4Addr, err := net.ResolveUDPAddr("udp4", addr)
 	if err != nil {
 		return nil, err
@@ -103,7 +106,7 @@ func New(addr string, c *Config) (*Server, error) {
 	}
 	return &Server{
 		config:           c,
-		socket:           socket,
+		PacketConn:       socket,
 		clients:          map[string]*client{},
 		timeoutCheckTime: time.Now().Add(10 * time.Second),
 	}, nil
@@ -130,13 +133,13 @@ func (s *Server) findProtocol(packet *ipx.Packet) (Protocol, bool) {
 // newClient is invoked when a new client should be started. When called, a
 // packet has been received from the given address but no client matches the
 // address.
-func (s *Server) newClient(ctx context.Context, protocol Protocol, addr *net.UDPAddr) *client {
+func (s *Server) newClient(ctx context.Context, protocol Protocol, addr net.Addr) *client {
 	addrStr := addr.String()
 	now := time.Now()
 	c := &client{
-		s:               s,
-		rxpipe:          pipe.New(),
-		addr:            addr,
+		Server:          s,
+		ReadWriteCloser: pipe.New(),
+		Addr:            addr,
 		lastReceiveTime: now,
 	}
 	s.clients[addrStr] = c
@@ -160,7 +163,7 @@ func (s *Server) newClient(ctx context.Context, protocol Protocol, addr *net.UDP
 
 // processPacket decodes a received UDP packet, delivering it to the appropriate
 // client based on address. A new client is started if none matches the address.
-func (s *Server) processPacket(ctx context.Context, packetBytes []byte, addr *net.UDPAddr) {
+func (s *Server) processPacket(ctx context.Context, packetBytes []byte, addr net.Addr) {
 	packet := &ipx.Packet{}
 	if err := packet.UnmarshalBinary(packetBytes); err != nil {
 		return
@@ -183,7 +186,7 @@ func (s *Server) processPacket(ctx context.Context, packetBytes []byte, addr *ne
 	s.mu.Unlock()
 
 	srcClient.lastReceiveTime = time.Now()
-	srcClient.rxpipe.WritePacket(packet)
+	srcClient.ReadWriteCloser.WritePacket(packet)
 }
 
 func (s *Server) allClients() []*client {
@@ -213,7 +216,7 @@ func (s *Server) checkClientTimeouts() time.Time {
 		if now.After(timeoutTime) {
 			s.log(("client %s timed out: nothing received " +
 				"since %s."),
-				c.addr.String(), c.lastReceiveTime)
+				c.Addr.String(), c.lastReceiveTime)
 			c.Close()
 		}
 
@@ -230,8 +233,8 @@ func (s *Server) checkClientTimeouts() time.Time {
 func (s *Server) poll(ctx context.Context) error {
 	var buf [1500]byte
 
-	s.socket.SetReadDeadline(s.timeoutCheckTime)
-	packetLen, addr, err := s.socket.ReadFromUDP(buf[:])
+	s.PacketConn.SetReadDeadline(s.timeoutCheckTime)
+	packetLen, addr, err := s.PacketConn.ReadFrom(buf[:])
 
 	if err == nil {
 		s.processPacket(ctx, buf[0:packetLen], addr)
@@ -262,5 +265,5 @@ func (s *Server) Close() error {
 	for _, client := range s.allClients() {
 		client.Close()
 	}
-	return s.socket.Close()
+	return s.PacketConn.Close()
 }
